@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>손가락 피아노</title>
+<style>
+  :root { --bg:#0e0f14; --fg:#e8e9ee; --accent:#ff6b9d; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family: system-ui, -apple-system, "Noto Sans KR", sans-serif; overflow:hidden; }
+  #stage { position:fixed; inset:0; }
+  video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover;
+    transform:scaleX(-1); opacity:.55; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; }
+  #overlay { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:16px; background:rgba(14,15,20,.92); z-index:10; text-align:center; padding:24px; }
+  #overlay h1 { margin:0; font-size:clamp(28px,5vw,48px); }
+  #overlay p { margin:0; opacity:.75; max-width:460px; line-height:1.6; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:999px; padding:14px 32px;
+    font-size:18px; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { position:fixed; top:12px; left:12px; z-index:5; font-size:14px; padding:6px 12px;
+    background:rgba(0,0,0,.5); border-radius:999px; }
+  #controls { position:fixed; top:12px; right:12px; z-index:5; display:flex; gap:8px; align-items:center;
+    background:rgba(0,0,0,.5); padding:6px 12px; border-radius:999px; font-size:14px; }
+  #controls select, #controls input { accent-color:var(--accent); }
+  #controls select { background:#222; color:var(--fg); border:1px solid #444; border-radius:6px; padding:2px 6px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="canvas"></canvas>
+</div>
+<div id="status">대기 중</div>
+<div id="controls">
+  <label>소리
+    <select id="wave">
+      <option value="triangle">부드러운</option>
+      <option value="sine">맑은</option>
+      <option value="square">8비트</option>
+      <option value="sawtooth">날카로운</option>
+    </select>
+  </label>
+  <label>음량 <input id="vol" type="range" min="0" max="1" step="0.05" value="0.6"></label>
+</div>
+<div id="overlay">
+  <h1>🎹 손가락 피아노</h1>
+  <p>웹캠 앞에서 손가락으로 아래 건반을 누르듯 짚어보세요.<br>
+     카메라 영상은 기기 밖으로 전송되지 않고 브라우저 안에서만 처리돼요.</p>
+  <button id="start">카메라 시작</button>
+  <p id="err" style="color:#ff8a8a"></p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const startBtn = document.getElementById('start');
+  const errEl = document.getElementById('err');
+  const overlay = document.getElementById('overlay');
+  const waveSel = document.getElementById('wave');
+  const volIn = document.getElementById('vol');
+
+  // ---------- 건반 설정 (C4 ~ B5, 2옥타브) ----------
+  const WHITE = ['C','D','E','F','G','A','B'];
+  const BLACK_AFTER = { C:'C#', D:'D#', F:'F#', G:'G#', A:'A#' };
+  const SEMI = { C:0,'C#':1,D:2,'D#':3,E:4,F:5,'F#':6,G:7,'G#':8,A:9,'A#':10,B:11 };
+  const OCTAVES = [4, 5];
+  const keys = []; // {note, midi, black, x,y,w,h, active}
+  const whites = [];
+  OCTAVES.forEach(o => WHITE.forEach(n => whites.push({ n, o })));
+  whites.push({ n:'C', o:6 }); // 마지막 도
+
+  function freq(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
+  function midiOf(n, o) { return 12 * (o + 1) + SEMI[n]; }
+
+  let W = 0, H = 0;
+  function layout() {
+    const dpr = window.devicePixelRatio || 1;
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    keys.length = 0;
+    const kw = W / whites.length;
+    const kh = Math.min(H * 0.38, 320);
+    const top = H - kh;
+    whites.forEach((k, i) => {
+      keys.push({ note:k.n + k.o, midi:midiOf(k.n,k.o), black:false, x:i*kw, y:top, w:kw, h:kh });
+    });
+    whites.forEach((k, i) => {
+      const b = BLACK_AFTER[k.n];
+      if (b && i < whites.length - 1) {
+        const bw = kw * 0.6;
+        keys.push({ note:b + k.o, midi:midiOf(b,k.o), black:true, x:(i+1)*kw - bw/2, y:top, w:bw, h:kh*0.6 });
+      }
+    });
+  }
+  window.addEventListener('resize', layout);
+  layout();
+
+  // ---------- 오디오 ----------
+  let ac, master;
+  const voices = new Map(); // midi -> {osc, gain}
+  function initAudio() {
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    master = ac.createGain();
+    master.gain.value = +volIn.value;
+    const comp = ac.createDynamicsCompressor();
+    master.connect(comp).connect(ac.destination);
+  }
+  volIn.addEventListener('input', () => { if (master) master.gain.value = +volIn.value; });
+
+  function noteOn(k) {
+    if (!ac || voices.has(k.midi)) return;
+    const t = ac.currentTime;
+    const osc = ac.createOscillator();
+    osc.type = waveSel.value;
+    osc.frequency.value = freq(k.midi);
+    const g = ac.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(0.5, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.25, t + 0.4);
+    osc.connect(g).connect(master);
+    osc.start(t);
+    voices.set(k.midi, { osc, g });
+  }
+  function noteOff(k) {
+    const v = voices.get(k.midi);
+    if (!v) return;
+    voices.delete(k.midi);
+    const t = ac.currentTime;
+    v.g.gain.cancelScheduledValues(t);
+    v.g.gain.setValueAtTime(Math.max(v.g.gain.value, 0.0001), t);
+    v.g.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+    v.osc.stop(t + 0.3);
+  }
+
+  // ---------- 손 인식 ----------
+  const TIPS = [4, 8, 12, 16, 20]; // 엄지~새끼 끝
+  const CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+    [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+  let lastResults = null;
+
+  function onResults(res) { lastResults = res; }
+
+  function keyAt(x, y) {
+    // 검은 건반 우선
+    for (const k of keys) if (k.black && x>=k.x && x<=k.x+k.w && y>=k.y && y<=k.y+k.h) return k;
+    for (const k of keys) if (!k.black && x>=k.x && x<=k.x+k.w && y>=k.y && y<=k.y+k.h) return k;
+    return null;
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    const pressed = new Set();
+    const tips = [];
+
+    // 영상은 object-fit: cover + 좌우반전이라 같은 방식으로 좌표 변환
+    const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+    const s = Math.max(W / vw, H / vh);
+    const ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
+    const toScreen = p => ({ x: W - (ox + p.x * vw * s), y: oy + p.y * vh * s });
+
+    if (lastResults && lastResults.multiHandLandmarks) {
+      for (const hand of lastResults.multiHandLandmarks) {
+        const pts = hand.map(toScreen);
+        ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (const [a, b] of CONNECTIONS) { ctx.moveTo(pts[a].x, pts[a].y); ctx.lineTo(pts[b].x, pts[b].y); }
+        ctx.stroke();
+        for (const i of TIPS) {
+          const p = pts[i];
+          tips.push(p);
+          const k = keyAt(p.x, p.y);
+          if (k) pressed.add(k);
+        }
+      }
+    }
+
+    // 한 손가락이 흰 건반과 검은 건반에 걸쳐 있을 땐 keyAt이 검은 건반만 반환
+    for (const k of keys) {
+      const on = pressed.has(k);
+      if (on) noteOn(k); else noteOff(k);
+      k.active = on;
+    }
+
+    // 건반 그리기 (흰 건반 → 검은 건반 순)
+    for (const pass of [false, true]) {
+      for (const k of keys) {
+        if (k.black !== pass) continue;
+        ctx.fillStyle = k.active ? (k.black ? '#c2185b' : '#ff9ec0') : (k.black ? '#15151b' : 'rgba(255,255,255,.88)');
+        ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.roundRect(k.x, k.y, k.w, k.h, [0, 0, 8, 8]);
+        ctx.fill(); ctx.stroke();
+        if (!k.black) {
+          ctx.fillStyle = k.active ? '#7a0c3a' : '#555';
+          ctx.font = '12px system-ui'; ctx.textAlign = 'center';
+          ctx.fillText(k.note, k.x + k.w/2, k.y + k.h - 10);
+        }
+      }
+    }
+
+    // 손끝 표시
+    for (const p of tips) {
+      ctx.fillStyle = '#ff6b9d'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    }
+
+    requestAnimationFrame(draw);
+  }
+
+  // ---------- 시작 ----------
+  async function start() {
+    startBtn.disabled = true; startBtn.textContent = '불러오는 중…';
+    errEl.textContent = '';
+    try {
+      if (!window.Hands) throw new Error('손 인식 라이브러리를 불러오지 못했어요. 인터넷 연결을 확인해주세요.');
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('이 브라우저는 카메라를 지원하지 않아요 (HTTPS 또는 localhost 필요).');
+      initAudio();
+      await ac.resume();
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false });
+      video.srcObject = stream;
+      await video.play();
+
+      const hands = new Hands({
+        locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
+      hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+      hands.onResults(onResults);
+      statusEl.textContent = '손 인식 모델 로딩 중…';
+      await hands.initialize();
+
+      overlay.style.display = 'none';
+      statusEl.textContent = '손가락으로 건반을 눌러보세요 🎶';
+
+      let busy = false;
+      const loop = async () => {
+        if (!busy && video.readyState >= 2) {
+          busy = true;
+          try { await hands.send({ image: video }); } catch (e) { console.error(e); }
+          busy = false;
+        }
+        requestAnimationFrame(loop);
+      };
+      loop();
+      draw();
+    } catch (e) {
+      console.error(e);
+      errEl.textContent = e.name === 'NotAllowedError' ? '카메라 권한을 허용해주세요.' : (e.message || String(e));
+      startBtn.disabled = false; startBtn.textContent = '다시 시도';
+    }
+  }
+  startBtn.addEventListener('click', start);
+})();
+</script>
+</body>
+</html>
