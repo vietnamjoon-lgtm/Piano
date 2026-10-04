@@ -47,7 +47,7 @@
 </div>
 <div id="overlay">
   <h1>🎹 손가락 피아노</h1>
-  <p>웹캠 앞에 두 손을 펴고, 손가락을 접을 때마다 소리가 나요.<br>왼손 새끼→엄지 = 도레미파솔, 오른손 엄지→중지 = 라시도,<br>오른손 약지 = 옥타브 ▼ / 새끼 = 옥타브 ▲<br><br>
+  <p>웹캠 앞에 두 손을 펴고, 손가락을 접을 때마다 소리가 나요.<br>왼손: 소지·약지=도, 중지=레, 검지=미, 엄지=파<br>오른손: 엄지=솔, 검지=라, 중지=시, 약지·소지=도<br><br>
      카메라 영상은 기기 밖으로 전송되지 않고 브라우저 안에서만 처리돼요.</p>
   <button id="start">카메라 시작</button>
   <p id="err" style="color:#ff8a8a"></p>
@@ -67,22 +67,22 @@
   const volIn = document.getElementById('vol');
 
   // ---------- 손가락 → 음 매핑 ----------
-  // 내 왼손 새끼~엄지 = 도레미파솔, 오른손 엄지~중지 = 라시도, 오른손 약지/새끼 = 옥타브 내림/올림
-  // 손가락 번호: 0 엄지, 1 검지, 2 중지, 3 약지, 4 새끼
-  const FINGER_NAME = ['엄지','검지','중지','약지','새끼'];
+  // 왼손: 소지/약지=도, 중지=레, 검지=미, 엄지=파
+  // 오른손: 엄지=솔, 검지=라, 중지=시, 약지/소지=높은 도
+  // 손가락 번호: 0 엄지, 1 검지, 2 중지, 3 약지, 4 소지 (fs 중 하나라도 접으면 소리)
+  const FINGER_NAME = ['엄지','검지','중지','약지','소지'];
   const SLOTS = [
-    { hand:'L', f:4, name:'도', semi:0  },
-    { hand:'L', f:3, name:'레', semi:2  },
-    { hand:'L', f:2, name:'미', semi:4  },
-    { hand:'L', f:1, name:'파', semi:5  },
-    { hand:'L', f:0, name:'솔', semi:7  },
-    { hand:'R', f:0, name:'라', semi:9  },
-    { hand:'R', f:1, name:'시', semi:11 },
-    { hand:'R', f:2, name:'도', semi:12 },
+    { hand:'L', fs:[4,3], name:'도', semi:0  },
+    { hand:'L', fs:[2],   name:'레', semi:2  },
+    { hand:'L', fs:[1],   name:'미', semi:4  },
+    { hand:'L', fs:[0],   name:'파', semi:5  },
+    { hand:'R', fs:[0],   name:'솔', semi:7  },
+    { hand:'R', fs:[1],   name:'라', semi:9  },
+    { hand:'R', fs:[2],   name:'시', semi:11 },
+    { hand:'R', fs:[3,4], name:'도', semi:12 },
   ];
-  const OCT_DOWN = { hand:'R', f:3 }, OCT_UP = { hand:'R', f:4 };
-  let octave = 4; // 도 = C{octave}
-  const MIN_OCT = 1, MAX_OCT = 7;
+  const octave = 4; // 도 = C4
+  const slotState = {}; // 슬롯 index -> 접힘 여부
   const flash = new Map(); // slot index -> 마지막 연주 시각
 
   function freq(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
@@ -159,18 +159,6 @@
     return out;
   }
 
-  function trigger(hand, f) {
-    if (hand === OCT_DOWN.hand && f === OCT_DOWN.f) { octave = Math.max(MIN_OCT, octave - 1); flashOct = performance.now(); return; }
-    if (hand === OCT_UP.hand && f === OCT_UP.f) { octave = Math.min(MAX_OCT, octave + 1); flashOct = performance.now(); return; }
-    SLOTS.forEach((s, i) => {
-      if (s.hand === hand && s.f === f) {
-        play(12 * (octave + 1) + s.semi);
-        flash.set(i, performance.now());
-      }
-    });
-  }
-  let flashOct = 0;
-
   function draw() {
     ctx.clearRect(0, 0, W, H);
     const now = performance.now();
@@ -194,7 +182,7 @@
           const prev = foldState[key];
           let cur = prev;
           if (prev === undefined) cur = r < FOLD_T[f];            // 처음 보일 땐 소리 없이 상태만 기록
-          else if (!prev && r < FOLD_T[f]) { cur = true; trigger(hand, f); }
+          else if (!prev && r < FOLD_T[f]) cur = true;
           else if (prev && r > OPEN_T[f]) cur = false;
           foldState[key] = cur;
 
@@ -202,17 +190,26 @@
           ctx.fillStyle = cur ? '#ff3b6b' : '#7dffb2'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
           ctx.beginPath(); ctx.arc(p.x, p.y, 10, 0, Math.PI*2); ctx.fill(); ctx.stroke();
           // 손가락에 음 이름 라벨
-          const slot = SLOTS.find(sl => sl.hand === hand && sl.f === f);
-          const label = slot ? slot.name : (hand === OCT_DOWN.hand && f === OCT_DOWN.f ? '옥타브▼' : hand === OCT_UP.hand && f === OCT_UP.f ? '옥타브▲' : '');
+          const slot = SLOTS.find(sl => sl.hand === hand && sl.fs.includes(f));
+          const label = slot ? slot.name : '';
           if (label) {
             ctx.fillStyle = '#fff'; ctx.font = 'bold 15px system-ui'; ctx.textAlign = 'center';
             ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.lineWidth = 3;
             ctx.strokeText(label, p.x, p.y - 18); ctx.fillText(label, p.x, p.y - 18);
           }
         }
+
+        // 슬롯(음) 단위로 접힘 시작 순간에 소리
+        SLOTS.forEach((sl, i) => {
+          if (sl.hand !== hand) return;
+          const on = sl.fs.some(f => foldState[hand + f]);
+          if (slotState[i] === false && on) { play(12 * (octave + 1) + sl.semi); flash.set(i, performance.now()); }
+          slotState[i] = on;
+        });
       }
     }
     for (const k of Object.keys(foldState)) if (!seen.has(k)) delete foldState[k]; // 손이 사라지면 초기화
+    SLOTS.forEach((sl, i) => { if (!seen.has(sl.hand + sl.fs[0])) delete slotState[i]; });
 
     // 하단 8칸 표시판
     const n = SLOTS.length, kw = Math.min(W / n, 120), kh = 110;
@@ -226,16 +223,8 @@
       ctx.fillStyle = '#222'; ctx.textAlign = 'center';
       ctx.font = 'bold 26px system-ui'; ctx.fillText(sl.name, x0 + i*kw + kw/2, y0 + 48);
       ctx.font = '12px system-ui'; ctx.fillStyle = '#666';
-      ctx.fillText((sl.hand === 'L' ? '왼손 ' : '오른손 ') + FINGER_NAME[sl.f], x0 + i*kw + kw/2, y0 + 80);
+      ctx.fillText((sl.hand === 'L' ? '왼손 ' : '오른손 ') + sl.fs.map(f => FINGER_NAME[f]).join('·'), x0 + i*kw + kw/2, y0 + 80);
     });
-    // 옥타브 표시
-    const ot = Math.max(0, 1 - (now - flashOct) / 400);
-    ctx.fillStyle = `rgba(255,${255 - ot*150},${255 - ot*100},1)`;
-    ctx.font = 'bold 20px system-ui'; ctx.textAlign = 'center';
-    ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.lineWidth = 4;
-    const txt = `옥타브 ${octave}  (오른손 약지 ▼ / 새끼 ▲)`;
-    ctx.strokeText(txt, W/2, y0 - 12); ctx.fillText(txt, W/2, y0 - 12);
-
     requestAnimationFrame(draw);
   }
 
