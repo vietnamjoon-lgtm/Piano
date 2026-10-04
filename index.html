@@ -47,7 +47,7 @@
 </div>
 <div id="overlay">
   <h1>🎹 손가락 피아노</h1>
-  <p>웹캠 앞에서 손가락으로 아래 건반을 누르듯 짚어보세요.<br>
+  <p>웹캠 앞에 두 손을 펴고, 손가락을 접을 때마다 소리가 나요.<br>왼손 새끼→엄지 = 도레미파솔, 오른손 엄지→중지 = 라시도,<br>오른손 약지 = 옥타브 ▼ / 새끼 = 옥타브 ▲<br><br>
      카메라 영상은 기기 밖으로 전송되지 않고 브라우저 안에서만 처리돼요.</p>
   <button id="start">카메라 시작</button>
   <p id="err" style="color:#ff8a8a"></p>
@@ -66,18 +66,26 @@
   const waveSel = document.getElementById('wave');
   const volIn = document.getElementById('vol');
 
-  // ---------- 건반 설정 (C4 ~ B5, 2옥타브) ----------
-  const WHITE = ['C','D','E','F','G','A','B'];
-  const BLACK_AFTER = { C:'C#', D:'D#', F:'F#', G:'G#', A:'A#' };
-  const SEMI = { C:0,'C#':1,D:2,'D#':3,E:4,F:5,'F#':6,G:7,'G#':8,A:9,'A#':10,B:11 };
-  const OCTAVES = [4, 5];
-  const keys = []; // {note, midi, black, x,y,w,h, active}
-  const whites = [];
-  OCTAVES.forEach(o => WHITE.forEach(n => whites.push({ n, o })));
-  whites.push({ n:'C', o:6 }); // 마지막 도
+  // ---------- 손가락 → 음 매핑 ----------
+  // 내 왼손 새끼~엄지 = 도레미파솔, 오른손 엄지~중지 = 라시도, 오른손 약지/새끼 = 옥타브 내림/올림
+  // 손가락 번호: 0 엄지, 1 검지, 2 중지, 3 약지, 4 새끼
+  const FINGER_NAME = ['엄지','검지','중지','약지','새끼'];
+  const SLOTS = [
+    { hand:'L', f:4, name:'도', semi:0  },
+    { hand:'L', f:3, name:'레', semi:2  },
+    { hand:'L', f:2, name:'미', semi:4  },
+    { hand:'L', f:1, name:'파', semi:5  },
+    { hand:'L', f:0, name:'솔', semi:7  },
+    { hand:'R', f:0, name:'라', semi:9  },
+    { hand:'R', f:1, name:'시', semi:11 },
+    { hand:'R', f:2, name:'도', semi:12 },
+  ];
+  const OCT_DOWN = { hand:'R', f:3 }, OCT_UP = { hand:'R', f:4 };
+  let octave = 4; // 도 = C{octave}
+  const MIN_OCT = 1, MAX_OCT = 7;
+  const flash = new Map(); // slot index -> 마지막 연주 시각
 
   function freq(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
-  function midiOf(n, o) { return 12 * (o + 1) + SEMI[n]; }
 
   let W = 0, H = 0;
   function layout() {
@@ -85,27 +93,12 @@
     W = window.innerWidth; H = window.innerHeight;
     canvas.width = W * dpr; canvas.height = H * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    keys.length = 0;
-    const kw = W / whites.length;
-    const kh = Math.min(H * 0.38, 320);
-    const top = H - kh;
-    whites.forEach((k, i) => {
-      keys.push({ note:k.n + k.o, midi:midiOf(k.n,k.o), black:false, x:i*kw, y:top, w:kw, h:kh });
-    });
-    whites.forEach((k, i) => {
-      const b = BLACK_AFTER[k.n];
-      if (b && i < whites.length - 1) {
-        const bw = kw * 0.6;
-        keys.push({ note:b + k.o, midi:midiOf(b,k.o), black:true, x:(i+1)*kw - bw/2, y:top, w:bw, h:kh*0.6 });
-      }
-    });
   }
   window.addEventListener('resize', layout);
   layout();
 
   // ---------- 오디오 ----------
   let ac, master;
-  const voices = new Map(); // midi -> {osc, gain}
   function initAudio() {
     ac = new (window.AudioContext || window.webkitAudioContext)();
     master = ac.createGain();
@@ -115,102 +108,133 @@
   }
   volIn.addEventListener('input', () => { if (master) master.gain.value = +volIn.value; });
 
-  function noteOn(k) {
-    if (!ac || voices.has(k.midi)) return;
+  // 접을 때마다 한 번 울리는 음 (자연스럽게 감쇠)
+  function play(midi) {
+    if (!ac) return;
     const t = ac.currentTime;
     const osc = ac.createOscillator();
     osc.type = waveSel.value;
-    osc.frequency.value = freq(k.midi);
+    osc.frequency.value = freq(midi);
     const g = ac.createGain();
     g.gain.setValueAtTime(0, t);
-    g.gain.linearRampToValueAtTime(0.5, t + 0.01);
-    g.gain.exponentialRampToValueAtTime(0.25, t + 0.4);
+    g.gain.linearRampToValueAtTime(0.6, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 1.4);
     osc.connect(g).connect(master);
     osc.start(t);
-    voices.set(k.midi, { osc, g });
-  }
-  function noteOff(k) {
-    const v = voices.get(k.midi);
-    if (!v) return;
-    voices.delete(k.midi);
-    const t = ac.currentTime;
-    v.g.gain.cancelScheduledValues(t);
-    v.g.gain.setValueAtTime(Math.max(v.g.gain.value, 0.0001), t);
-    v.g.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
-    v.osc.stop(t + 0.3);
+    osc.stop(t + 1.5);
   }
 
-  // ---------- 손 인식 ----------
-  const TIPS = [4, 8, 12, 16, 20]; // 엄지~새끼 끝
+  // ---------- 손 인식 / 접힘 판정 ----------
+  const TIPS = [4, 8, 12, 16, 20];
+  const PIP  = [3, 6, 10, 14, 18];
   const CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
     [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
   let lastResults = null;
-
+  const foldState = {}; // "L0".."R4" -> true(접힘)/false(폄)
   function onResults(res) { lastResults = res; }
 
-  function keyAt(x, y) {
-    // 검은 건반 우선
-    for (const k of keys) if (k.black && x>=k.x && x<=k.x+k.w && y>=k.y && y<=k.y+k.h) return k;
-    for (const k of keys) if (!k.black && x>=k.x && x<=k.x+k.w && y>=k.y && y<=k.y+k.h) return k;
-    return null;
+  const vw = () => video.videoWidth || 640, vh = () => video.videoHeight || 480;
+  // 픽셀 비율을 맞춘 거리 (정규화 좌표는 가로세로 비율이 달라 왜곡됨)
+  function dist(a, b) { return Math.hypot((a.x - b.x) * vw(), (a.y - b.y) * vh()); }
+
+  // 접힘 비율: 작을수록 접힘. 히스테리시스로 떨림 방지.
+  function foldRatio(hand, f) {
+    if (f === 0) return dist(hand[4], hand[17]) / dist(hand[2], hand[17]); // 엄지: 손바닥 쪽으로 접히면 새끼 뿌리와 가까워짐
+    return dist(hand[TIPS[f]], hand[0]) / dist(hand[PIP[f]], hand[0]);     // 나머지: 끝이 손목에 가까워지면 접힘
   }
+  const FOLD_T = [1.0, 0.95, 0.95, 0.95, 0.95], OPEN_T = [1.2, 1.1, 1.1, 1.1, 1.1];
+
+  function assignHands(res) {
+    const hs = res.multiHandLandmarks || [];
+    const out = []; // {hand:'L'|'R', pts}
+    if (hs.length === 1) {
+      // 영상을 좌우반전 없이 넣기 때문에 MediaPipe 라벨이 실제와 반대
+      const label = res.multiHandedness?.[0]?.label;
+      out.push({ hand: label === 'Right' ? 'L' : 'R', pts: hs[0] });
+    } else if (hs.length >= 2) {
+      // 거울 화면 기준 왼쪽에 보이는 손 = 내 왼손
+      const sorted = hs.slice(0, 2).sort((a, b) => b[0].x - a[0].x); // 원본 x가 큰 쪽이 내 왼손
+      out.push({ hand:'L', pts: sorted[0] }, { hand:'R', pts: sorted[1] });
+    }
+    return out;
+  }
+
+  function trigger(hand, f) {
+    if (hand === OCT_DOWN.hand && f === OCT_DOWN.f) { octave = Math.max(MIN_OCT, octave - 1); flashOct = performance.now(); return; }
+    if (hand === OCT_UP.hand && f === OCT_UP.f) { octave = Math.min(MAX_OCT, octave + 1); flashOct = performance.now(); return; }
+    SLOTS.forEach((s, i) => {
+      if (s.hand === hand && s.f === f) {
+        play(12 * (octave + 1) + s.semi);
+        flash.set(i, performance.now());
+      }
+    });
+  }
+  let flashOct = 0;
 
   function draw() {
     ctx.clearRect(0, 0, W, H);
-    const pressed = new Set();
-    const tips = [];
+    const now = performance.now();
+    const w = vw(), h = vh();
+    const s = Math.max(W / w, H / h);
+    const ox = (W - w * s) / 2, oy = (H - h * s) / 2;
+    const toScreen = p => ({ x: W - (ox + p.x * w * s), y: oy + p.y * h * s });
 
-    // 영상은 object-fit: cover + 좌우반전이라 같은 방식으로 좌표 변환
-    const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
-    const s = Math.max(W / vw, H / vh);
-    const ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
-    const toScreen = p => ({ x: W - (ox + p.x * vw * s), y: oy + p.y * vh * s });
-
-    if (lastResults && lastResults.multiHandLandmarks) {
-      for (const hand of lastResults.multiHandLandmarks) {
-        const pts = hand.map(toScreen);
+    const seen = new Set();
+    if (lastResults) {
+      for (const { hand, pts } of assignHands(lastResults)) {
+        const sp = pts.map(toScreen);
         ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 2;
         ctx.beginPath();
-        for (const [a, b] of CONNECTIONS) { ctx.moveTo(pts[a].x, pts[a].y); ctx.lineTo(pts[b].x, pts[b].y); }
+        for (const [a, b] of CONNECTIONS) { ctx.moveTo(sp[a].x, sp[a].y); ctx.lineTo(sp[b].x, sp[b].y); }
         ctx.stroke();
-        for (const i of TIPS) {
-          const p = pts[i];
-          tips.push(p);
-          const k = keyAt(p.x, p.y);
-          if (k) pressed.add(k);
+
+        for (let f = 0; f < 5; f++) {
+          const key = hand + f; seen.add(key);
+          const r = foldRatio(pts, f);
+          const prev = foldState[key];
+          let cur = prev;
+          if (prev === undefined) cur = r < FOLD_T[f];            // 처음 보일 땐 소리 없이 상태만 기록
+          else if (!prev && r < FOLD_T[f]) { cur = true; trigger(hand, f); }
+          else if (prev && r > OPEN_T[f]) cur = false;
+          foldState[key] = cur;
+
+          const p = sp[TIPS[f]];
+          ctx.fillStyle = cur ? '#ff3b6b' : '#7dffb2'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(p.x, p.y, 10, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+          // 손가락에 음 이름 라벨
+          const slot = SLOTS.find(sl => sl.hand === hand && sl.f === f);
+          const label = slot ? slot.name : (hand === OCT_DOWN.hand && f === OCT_DOWN.f ? '옥타브▼' : hand === OCT_UP.hand && f === OCT_UP.f ? '옥타브▲' : '');
+          if (label) {
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 15px system-ui'; ctx.textAlign = 'center';
+            ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.lineWidth = 3;
+            ctx.strokeText(label, p.x, p.y - 18); ctx.fillText(label, p.x, p.y - 18);
+          }
         }
       }
     }
+    for (const k of Object.keys(foldState)) if (!seen.has(k)) delete foldState[k]; // 손이 사라지면 초기화
 
-    // 한 손가락이 흰 건반과 검은 건반에 걸쳐 있을 땐 keyAt이 검은 건반만 반환
-    for (const k of keys) {
-      const on = pressed.has(k);
-      if (on) noteOn(k); else noteOff(k);
-      k.active = on;
-    }
-
-    // 건반 그리기 (흰 건반 → 검은 건반 순)
-    for (const pass of [false, true]) {
-      for (const k of keys) {
-        if (k.black !== pass) continue;
-        ctx.fillStyle = k.active ? (k.black ? '#c2185b' : '#ff9ec0') : (k.black ? '#15151b' : 'rgba(255,255,255,.88)');
-        ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.roundRect(k.x, k.y, k.w, k.h, [0, 0, 8, 8]);
-        ctx.fill(); ctx.stroke();
-        if (!k.black) {
-          ctx.fillStyle = k.active ? '#7a0c3a' : '#555';
-          ctx.font = '12px system-ui'; ctx.textAlign = 'center';
-          ctx.fillText(k.note, k.x + k.w/2, k.y + k.h - 10);
-        }
-      }
-    }
-
-    // 손끝 표시
-    for (const p of tips) {
-      ctx.fillStyle = '#ff6b9d'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, Math.PI*2); ctx.fill(); ctx.stroke();
-    }
+    // 하단 8칸 표시판
+    const n = SLOTS.length, kw = Math.min(W / n, 120), kh = 110;
+    const x0 = (W - kw * n) / 2, y0 = H - kh - 16;
+    SLOTS.forEach((sl, i) => {
+      const t = now - (flash.get(i) || -1e9);
+      const on = Math.max(0, 1 - t / 250);
+      ctx.fillStyle = `rgba(${255 - on*0},${255 - on*95},${255 - on*60},${.85})`;
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.roundRect(x0 + i*kw, y0, kw, kh, 10); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#222'; ctx.textAlign = 'center';
+      ctx.font = 'bold 26px system-ui'; ctx.fillText(sl.name, x0 + i*kw + kw/2, y0 + 48);
+      ctx.font = '12px system-ui'; ctx.fillStyle = '#666';
+      ctx.fillText((sl.hand === 'L' ? '왼손 ' : '오른손 ') + FINGER_NAME[sl.f], x0 + i*kw + kw/2, y0 + 80);
+    });
+    // 옥타브 표시
+    const ot = Math.max(0, 1 - (now - flashOct) / 400);
+    ctx.fillStyle = `rgba(255,${255 - ot*150},${255 - ot*100},1)`;
+    ctx.font = 'bold 20px system-ui'; ctx.textAlign = 'center';
+    ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.lineWidth = 4;
+    const txt = `옥타브 ${octave}  (오른손 약지 ▼ / 새끼 ▲)`;
+    ctx.strokeText(txt, W/2, y0 - 12); ctx.fillText(txt, W/2, y0 - 12);
 
     requestAnimationFrame(draw);
   }
@@ -238,7 +262,7 @@
       await hands.initialize();
 
       overlay.style.display = 'none';
-      statusEl.textContent = '손가락으로 건반을 눌러보세요 🎶';
+      statusEl.textContent = '손가락을 접어보세요 🎶';
 
       let busy = false;
       const loop = async () => {
