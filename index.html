@@ -47,13 +47,14 @@
 </div>
 <div id="overlay">
   <h1>🎹 손가락 피아노</h1>
-  <p>웹캠 앞에 두 손을 펴고, 손가락을 접을 때마다 소리가 나요.<br>왼손: 소지·약지=도, 중지=레, 검지=미, 엄지=파<br>오른손: 엄지=솔, 검지=라, 중지=시, 약지·소지=도<br><br>
+  <p>웹캠 앞에 두 손을 펴고, 손가락을 접을 때마다 소리가 나요.<br>고개를 내 왼쪽으로 돌리면 옥타브 ▼, 오른쪽으로 돌리면 옥타브 ▲<br>왼손: 소지·약지=도, 중지=레, 검지=미, 엄지=파<br>오른손: 엄지=솔, 검지=라, 중지=시, 약지·소지=도<br><br>
      카메라 영상은 기기 밖으로 전송되지 않고 브라우저 안에서만 처리돼요.</p>
   <button id="start">카메라 시작</button>
   <p id="err" style="color:#ff8a8a"></p>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js" crossorigin="anonymous"></script>
 <script>
 (() => {
   const video = document.getElementById('video');
@@ -81,7 +82,9 @@
     { hand:'R', fs:[2],   name:'시', semi:11 },
     { hand:'R', fs:[3,4], name:'도', semi:12 },
   ];
-  const octave = 4; // 도 = C4
+  let octave = 4; // 도 = C{octave}
+  const MIN_OCT = 1, MAX_OCT = 7;
+  let octFlash = 0, headDir = 0, headReady = false;
   const slotState = {}; // 슬롯 index -> 접힘 여부
   const flash = new Map(); // slot index -> 마지막 연주 시각
 
@@ -130,6 +133,22 @@
   const CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
     [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
   let lastResults = null;
+
+  // ---------- 고개 돌림 → 옥타브 ----------
+  // 코 위치가 양 볼 사이에서 어디쯤인지(0~1)로 좌우 회전 추정. 원본(비반전) 영상 기준 값이 클수록 내 왼쪽으로 돌린 것.
+  const TURN_ON = 0.15, TURN_OFF = 0.07;
+  let headState = 0; // 0 정면, -1 왼쪽으로 돌린 상태, +1 오른쪽으로 돌린 상태
+  function onFace(res) {
+    const f = res.multiFaceLandmarks && res.multiFaceLandmarks[0];
+    if (!f) { headDir = 0; return; }
+    const l = f[234], r = f[454], n = f[1];
+    const dev = (n.x - l.x) / (r.x - l.x) - 0.5; // +: 내 왼쪽, -: 내 오른쪽
+    headDir = dev;
+    if (headState === 0) {
+      if (dev > TURN_ON) { headState = -1; octave = Math.max(MIN_OCT, octave - 1); octFlash = performance.now(); }
+      else if (dev < -TURN_ON) { headState = 1; octave = Math.min(MAX_OCT, octave + 1); octFlash = performance.now(); }
+    } else if (Math.abs(dev) < TURN_OFF) headState = 0; // 정면으로 돌아와야 다시 반응
+  }
   const foldState = {}; // "L0".."R4" -> true(접힘)/false(폄)
   function onResults(res) { lastResults = res; }
 
@@ -225,6 +244,14 @@
       ctx.font = '12px system-ui'; ctx.fillStyle = '#666';
       ctx.fillText((sl.hand === 'L' ? '왼손 ' : '오른손 ') + sl.fs.map(f => FINGER_NAME[f]).join('·'), x0 + i*kw + kw/2, y0 + 80);
     });
+    // 옥타브 표시
+    const ot = Math.max(0, 1 - (now - octFlash) / 500);
+    ctx.fillStyle = `rgba(255,${255 - ot*150},${255 - ot*100},1)`;
+    ctx.font = 'bold 22px system-ui'; ctx.textAlign = 'center';
+    ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.lineWidth = 4;
+    const txt = headReady ? `옥타브 ${octave}   (고개 왼쪽 ▼ / 오른쪽 ▲)` : `옥타브 ${octave}`;
+    ctx.strokeText(txt, W/2, y0 - 12); ctx.fillText(txt, W/2, y0 - 12);
+
     requestAnimationFrame(draw);
   }
 
@@ -250,6 +277,18 @@
       statusEl.textContent = '손 인식 모델 로딩 중…';
       await hands.initialize();
 
+      // 얼굴 모델은 실패해도 손 연주는 되도록 따로 로드
+      let face = null;
+      try {
+        if (!window.FaceMesh) throw new Error('face lib missing');
+        face = new FaceMesh({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${f}` });
+        face.setOptions({ maxNumFaces: 1, refineLandmarks: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        face.onResults(onFace);
+        statusEl.textContent = '얼굴 인식 모델 로딩 중…';
+        await face.initialize();
+        headReady = true;
+      } catch (e) { console.error(e); face = null; }
+
       overlay.style.display = 'none';
       statusEl.textContent = '손가락을 접어보세요 🎶';
 
@@ -258,6 +297,7 @@
         if (!busy && video.readyState >= 2) {
           busy = true;
           try { await hands.send({ image: video }); } catch (e) { console.error(e); }
+          if (face) { try { await face.send({ image: video }); } catch (e) { console.error(e); } }
           busy = false;
         }
         requestAnimationFrame(loop);
