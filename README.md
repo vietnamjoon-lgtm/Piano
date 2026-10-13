@@ -8,3 +8,6 @@
     python3 -m http.server 8000
 
 브라우저에서 http://localhost:8000 접속 → "카메라 시작" → 손가락으로 건반을 짚으면 소리가 나요.
+
+## 색 맞추기 도우미
+`color_matcher/` 폴더 참고.
