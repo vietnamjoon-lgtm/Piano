@@ -1,0 +1,4 @@
+config.json
+log.txt
+debug/
+__pycache__/

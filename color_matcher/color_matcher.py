@@ -31,6 +31,7 @@ if sys.platform == "win32":
             pass
 
 import mss
+import mss.tools
 import numpy as np
 import pyautogui
 
@@ -111,52 +112,160 @@ class Board:
         return [int(ix + self.x0), int(iy + self.y0)], float(np.sqrt(d[iy, ix]))
 
 
-def drag(frm, to):
-    """frm 지점을 잡아서 to 지점까지 끌고, 미끄러지지 않게 잠깐 멈췄다 놓는다."""
-    pyautogui.moveTo(*frm)
+def measure_shift(before, after, valid, predict):
+    """끌기 전/후 판 화면을 비교해서 판이 실제로 몇 px 움직였는지 잰다. (작은 그림으로 대충 → 원본으로 정밀)"""
+    def best(a, b, m, cands):
+        h, w = m.shape
+        top, score = (0, 0), np.inf
+        for dx, dy in cands:
+            if abs(dx) >= w * 0.7 or abs(dy) >= h * 0.7:
+                continue
+            ys, ye = max(0, dy), min(h, h + dy)
+            xs, xe = max(0, dx), min(w, w + dx)
+            bb = b[ys:ye, xs:xe]
+            aa = a[ys - dy:ye - dy, xs - dx:xe - dx]
+            mm = m[ys:ye, xs:xe] & m[ys - dy:ye - dy, xs - dx:xe - dx]
+            n = mm.sum()
+            if n < m.size * 0.15:
+                continue
+            sc = (((aa - bb) ** 2).sum(axis=2) * mm).sum() / n
+            if sc < score:
+                top, score = (dx, dy), sc
+        return top, score
+
+    k = 4
+    h, w = valid.shape
+    hh, ww = h // k * k, w // k * k
+    pool = lambda im: im[:hh, :ww].reshape(hh // k, k, ww // k, k, -1).mean(axis=(1, 3))
+    ms = valid[:hh, :ww].reshape(hh // k, k, ww // k, k).all(axis=(1, 3))
+    a, b = pool(before.astype(float)), pool(after.astype(float))
+    # 예상 이동량 주변만 찾는다 (+ 안 움직였는지 확인용 (0,0))
+    px, py = np.asarray(predict, float) / k
+    rx, ry = abs(px) * 0.6 + 4, abs(py) * 0.6 + 4
+    cands = {(0, 0)} | {(x, y) for x in range(int(px - rx), int(px + rx) + 1)
+                        for y in range(int(py - ry), int(py + ry) + 1)}
+    (cx, cy), _ = best(a, b, ms, cands)
+    fine = [(cx * k + x, cy * k + y) for x in range(-k, k + 1) for y in range(-k, k + 1)]
+    (fx, fy), score = best(before.astype(float), after.astype(float), valid, fine)
+    return np.array([fx, fy], float), score
+
+
+def drag_by(board, frm, vec):
+    """frm 지점을 잡고 vec 만큼 끈다. 판 밖으로 나가면 잡는 지점을 판 안으로 옮긴다."""
+    vec = np.asarray(vec, float)
+    lo = np.array([board.x0 + 5, board.y0 + 5], float)
+    hi = np.array([board.x0 + board.w - 6, board.y0 + board.h - 6], float)
+    frm = np.asarray(frm, float)
+    if np.any(frm + vec < lo) or np.any(frm + vec > hi):
+        frm = np.clip((lo + hi) / 2 - vec / 2, lo, hi)
+    to = np.clip(frm + vec, lo, hi)
+    pyautogui.moveTo(int(frm[0]), int(frm[1]))
     pyautogui.mouseDown()
-    pyautogui.moveTo(*to, duration=DRAG_TIME)
-    time.sleep(0.02)
+    pyautogui.moveTo(int(to[0]), int(to[1]), duration=DRAG_TIME)
+    time.sleep(0.03)  # 멈췄다 놓아야 판이 미끄러지지 않음
     pyautogui.mouseUp()
+    return to - frm
 
 
-def solve(sct, cfg, board, start):
+def mark(img, p, board, color):
+    x, y = p[0] - board.x0, p[1] - board.y0
+    out = img
+    for d in range(-6, 7):
+        for (xx, yy) in ((x + d, y), (x, y + d)):
+            if 0 <= xx < board.w and 0 <= yy < board.h:
+                out[yy, xx] = color
+
+
+def save_png(img, path):
+    rgb = np.clip(img, 0, 255).astype(np.uint8)
+    mss.tools.to_png(rgb.tobytes(), (rgb.shape[1], rgb.shape[0]), output=str(path))
+
+
+def solve(sct, cfg, board, start, debug_dir=None, rnd=0):
     target = read_swatch(sct, cfg["target"])
     pin = cfg["pin"]
+    gain = cfg.setdefault("gain", [1.0, 1.0])  # 마우스 1px 당 판이 움직이는 px
 
+    board.capture(sct)
     for attempt in range(MAX_TRIES):
         if attempt and time.perf_counter() - start > TIME_BUDGET:
-            print("    시간 여유가 없어 재시도 생략")
+            log("    시간 여유가 없어 재시도 생략")
             break
-        board.capture(sct)
+        before = board.img
         spot, err = board.find(target)
-        drag(spot, pin)
+        want = np.array(pin, float) - spot                  # 판이 움직여야 할 양
+        cmd = want / np.array(gain)                          # 마우스로 끌어야 할 양
+        moved_mouse = drag_by(board, spot, cmd)
         time.sleep(SETTLE)
 
+        board.capture(sct)
+        shift, score = measure_shift(before, board.img, ~board.blocked, moved_mouse * np.array(gain))
         chosen = read_swatch(sct, cfg["selected"])
         diff = color_dist(chosen, target)
-        print(f"    시도 {attempt + 1}: 정답 {target.round().astype(int)} "
-              f"선택 {chosen.round().astype(int)} 차이 {diff:.1f}")
+        log(f"    시도 {attempt + 1}: 정답 {target.round().astype(int)} 선택 {chosen.round().astype(int)} "
+            f"차이 {diff:.1f} | 찾은곳 {spot} 판에서제일비슷 {err:.0f} | "
+            f"마우스 {moved_mouse.round().astype(int)} 판이동 {shift.astype(int)} (목표 {want.astype(int)})")
+
+        if debug_dir is not None:
+            b = before.copy(); mark(b, spot, board, (255, 0, 0)); mark(b, pin, board, (0, 255, 0))
+            save_png(b, debug_dir / f"r{rnd}_t{attempt + 1}_before.png")
+            a = board.img.copy(); mark(a, pin, board, (0, 255, 0))
+            save_png(a, debug_dir / f"r{rnd}_t{attempt + 1}_after.png")
+
+        # 판이 실제로 움직인 비율 학습
+        for i in range(2):
+            if abs(moved_mouse[i]) > 20 and abs(shift[i]) > 3:
+                g = shift[i] / moved_mouse[i]
+                if 0.5 < g / gain[i] < 2:  # 판 끝에 걸려 덜 움직인 경우 등 이상값은 무시
+                    gain[i] = min(max(0.7 * gain[i] + 0.3 * g, 0.2), 5.0)
+        if np.abs(moved_mouse).max() > 15 and np.abs(shift).max() < 2:
+            log("    ⚠ 끌었는데 판이 안 움직였어요. cmd 창을 '관리자 권한으로 실행'해서 다시 해 보세요.")
+
         if diff <= GOOD_ENOUGH:
             break
-        # 끌기 전 화면에서, 실제로 선택된 색이 'spot' 주변 어디였는지 찾는다.
-        # 그 차이만큼 '진짜 선택 지점'이 핀 끝 설정과 어긋나 있다는 뜻 → 보정
-        actual, _ = board.find(chosen, near=spot, radius=40)
-        if color_dist(board.img[actual[1] - board.y0, actual[0] - board.x0], chosen) < 15:
-            pin[0] += actual[0] - spot[0]
-            pin[1] += actual[1] - spot[1]
+        # 실제 선택된 색이 끌기 전 화면에서 어디였는지 → 핀이 진짜로 가리키는 지점 보정
+        # (판이 끝에 걸려 덜 움직였으면 핀 탓이 아니므로 보정하지 않음)
+        guess = np.array(pin) - shift
+        actual, _ = board_find_in(board, before, chosen, guess, 40)
+        if actual is not None and np.abs(shift - want).max() <= 6:
+            true_pin = (np.array(actual) + shift).round().astype(int)
+            step = np.clip(true_pin - np.array(pin), -8, 8)  # 한 번에 조금씩만 보정
+            pin[0], pin[1] = int(pin[0] + step[0]), int(pin[1] + step[1])
 
     pyautogui.moveTo(cfg["picker_br"][0] + 40, cfg["picker_br"][1] + 40)  # 커서가 색 칸 가리지 않게
-    print(f"    걸린 시간 {time.perf_counter() - start:.2f}초")
+    log(f"    걸린 시간 {time.perf_counter() - start:.2f}초  (판 이동 비율 {gain[0]:.2f},{gain[1]:.2f})")
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
-def run():
+def board_find_in(board, img, color, near, radius):
+    saved = board.img
+    board.img = img
+    p, e = board.find(color, near=near, radius=radius)
+    board.img = saved
+    return (p, e) if e < 15 else (None, e)
+
+
+LOG_PATH = Path(__file__).with_name("log.txt")
+
+
+def log(msg):
+    print(msg)
+    with LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+
+
+def run(debug):
     if not CONFIG_PATH.exists():
         print("설정이 없어요. 먼저 `python color_matcher.py --setup` 을 실행하세요.")
         return
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     board = Board(cfg)
+    debug_dir = None
+    if debug:
+        debug_dir = Path(__file__).with_name("debug")
+        debug_dir.mkdir(exist_ok=True)
+    LOG_PATH.write_text("", encoding="utf-8")
+    rnd = 0
     print("대기 중… 정답 색이 바뀌면 자동으로 맞춥니다. (종료: Ctrl+C)")
 
     with mss.mss() as sct:
@@ -166,8 +275,9 @@ def run():
             if last is None or color_dist(target, last) > CHANGE_THRESHOLD:
                 start = time.perf_counter()
                 time.sleep(0.05)  # 색이 다 바뀔 때까지 아주 잠깐 대기
-                print(f"[새 라운드] 정답 색 {read_swatch(sct, cfg['target']).round().astype(int)}")
-                solve(sct, cfg, board, start)
+                rnd += 1
+                log(f"[라운드 {rnd}] 정답 색 {read_swatch(sct, cfg['target']).round().astype(int)}")
+                solve(sct, cfg, board, start, debug_dir, rnd)
                 last = read_swatch(sct, cfg["target"])
             time.sleep(0.03)
 
@@ -175,9 +285,10 @@ def run():
 def main():
     ap = argparse.ArgumentParser(description="정답 색 맞추기 자동 도우미")
     ap.add_argument("--setup", action="store_true", help="화면 위치 지정")
+    ap.add_argument("--debug", action="store_true", help="시도마다 판 화면을 debug 폴더에 저장")
     args = ap.parse_args()
     try:
-        setup() if args.setup else run()
+        setup() if args.setup else run(args.debug)
     except KeyboardInterrupt:
         print("\n종료")
     except pyautogui.FailSafeException:
