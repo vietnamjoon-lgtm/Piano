@@ -40,6 +40,7 @@ SWATCH_RADIUS = 6       # 색 칸 가운데에서 평균 낼 반경(px)
 PIN_MASK = (35, 70)     # 핀 그림이 가리는 영역: 좌우 반폭, 위쪽 높이(px)
 CHANGE_THRESHOLD = 25   # 정답 색이 이만큼 바뀌면 새 라운드로 판단
 GOOD_ENOUGH = 6         # 선택 색과 정답 색 차이가 이 이하면 성공
+TIME_BUDGET = 2.0       # 제한 3초 중 여유를 두고, 이 시간이 지나면 재시도 안 함(초)
 
 
 def ask_point(label):
@@ -132,12 +133,15 @@ def move_pin(frm, to, drag):
     pyautogui.mouseUp()
 
 
-def solve(sct, cfg, picker, drag):
+def solve(sct, cfg, picker, drag, start):
     target = read_swatch(sct, cfg["target"])
     picker.refresh(sct, cfg["pin"])
     best, err = picker.find(target)
 
     for attempt in range(3):
+        if attempt and time.perf_counter() - start > TIME_BUDGET:
+            print("    시간 여유가 없어 재시도 생략")
+            break
         aim = picker.clamp([best[0] + cfg["offset"][0], best[1] + cfg["offset"][1]])
         move_pin(cfg["pin"], aim, drag)
         cfg["pin"] = aim
@@ -155,6 +159,7 @@ def solve(sct, cfg, picker, drag):
         cfg["offset"][1] += aim[1] - actual[1]
 
     pyautogui.moveTo(cfg["picker_br"][0] + 40, cfg["picker_br"][1] + 40)  # 커서가 색 칸 가리지 않게
+    print(f"    걸린 시간 {time.perf_counter() - start:.2f}초")
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
@@ -171,9 +176,10 @@ def run(drag):
         while True:
             target = read_swatch(sct, cfg["target"])
             if last is None or color_dist(target, last) > CHANGE_THRESHOLD:
+                start = time.perf_counter()
                 time.sleep(0.05)  # 색이 다 바뀔 때까지 아주 잠깐 대기
                 print(f"[새 라운드] 정답 색 {read_swatch(sct, cfg['target']).round().astype(int)}")
-                solve(sct, cfg, picker, drag)
+                solve(sct, cfg, picker, drag, start)
                 last = read_swatch(sct, cfg["target"])
             time.sleep(0.03)
 
